@@ -125,15 +125,37 @@ class UsefFeature(BaseSpeakerFeature):
 
     def __init__(self, config, eps=torch.finfo(torch.float32).eps):
         super().__init__()
-        ks, padding = (config["t_ksize"], 3), (config["t_ksize"] // 2, 1)
-        norm_type = "cLN" if config["causal"] else "GN"
-        self.usef_con2v = nn.Sequential(
-            select_norm(norm_type, config["spec_dim"], eps),
-            nn.Conv2d(config["spec_dim"],
-                      config["emb_dim"],
-                      ks,
-                      padding=padding),
-        )
+
+        self.causal = config["causal"]
+
+        ks = (config["t_ksize"], 3)
+        padding = (config["t_ksize"] // 2, 1)
+
+        if not self.causal:
+            # === non-causal: shared encoder ===
+            self.usef_con2v = nn.Sequential(
+                select_norm("GN", config["spec_dim"], eps),
+                nn.Conv2d(config["spec_dim"],
+                          config["emb_dim"],
+                          ks,
+                          padding=padding),
+            )
+        else:
+            # === causal: individual encoder + norm ===
+            self.mix_encoder = nn.Sequential(
+                select_norm("cLN", config["spec_dim"], eps),
+                nn.Conv2d(config["spec_dim"],
+                          config["emb_dim"],
+                          ks,
+                          padding=padding),
+            )
+            self.enroll_encoder = nn.Sequential(
+                select_norm("GN", config["spec_dim"], eps),
+                nn.Conv2d(config["spec_dim"],
+                          config["emb_dim"],
+                          ks,
+                          padding=padding),
+            )
         self.usef_att = USEF_attentionblock(
             emb_dim=config["emb_dim"],
             n_freqs=config["enc_dim"],
@@ -153,8 +175,12 @@ class UsefFeature(BaseSpeakerFeature):
         mix = mix.permute(0, 1, 3, 2).contiguous()  # B, 2, T, F
         enroll = enroll.permute(0, 1, 3, 2).contiguous()  # B, 2, T, F
 
-        mix = self.usef_con2v(mix)  # B, 128, T, F,
-        enroll = self.usef_con2v(enroll)
+        if not self.causal:
+            mix = self.usef_con2v(mix)  # B, 128, T, F,
+            enroll = self.usef_con2v(enroll)
+        else:
+            mix = self.mix_encoder(mix)
+            enroll = self.enroll_encoder(enroll)
 
         enroll = self.usef_att(mix, enroll)  # B, 128, T, F
 

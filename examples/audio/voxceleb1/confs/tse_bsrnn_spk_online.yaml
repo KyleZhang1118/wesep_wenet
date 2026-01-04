@@ -1,8 +1,8 @@
 dataloader_args:
-  batch_size: 8 #RTX2080 1, V100: 8, A800: 16
+  batch_size: 12
   drop_last: true
   num_workers: 6
-  pin_memory: true
+  pin_memory: false
   prefetch_factor: 6
 
 dataset_args:
@@ -11,22 +11,24 @@ dataset_args:
   shuffle: true
   shuffle_args:
     shuffle_size: 2500
+  filter_len: true
+  filter_len_args:
+      min_num_seconds: 1.0
+      max_num_seconds: 100.0
   chunk_len: 48000
+  online_mix: true
+  num_speakers: 2
+  use_random_snr: true
   speaker_feat: &speaker_feat False
   fbank_args:
     num_mel_bins: 80
     frame_shift: 10
     frame_length: 25
     dither: 1.0
-  noise_lmdb_file: './data/musan/lmdb'
-  noise_prob: 0 # prob to add noise aug per sample
-  specaug_enroll_prob: 0 # prob to apply SpecAug on fbank of enrollment speech
-  reverb_enroll_prob: 0 # prob to add reverb aug on enrollment speech
-  noise_enroll_prob: 0 # prob to add noise aug on enrollment speech
-  # Self-estimated Speech Augmentation (SSA). Please ref our SLT paper: https://www.arxiv.org/abs/2409.09589
-  # only Single-optimization method is supported here.
-  # if you want to use multi-optimization, please ref bsrnn_multi_optim.yaml
-  SSA_enroll_prob:  0  # prob to add SSA on enrollment speech
+
+  noise_lmdb_file:  './data/musan/lmdb'
+  noise_prob: 0
+  reverb_prob: 0
 
 enable_amp: false
 exp_dir: exp/BSRNN
@@ -35,11 +37,6 @@ log_batch_interval: 100
 
 loss: SISDR
 loss_args: { }
-
-# loss: [SISDR, CE]               ### For joint training the speaker encoder with CE loss. Put SISDR in the first position for validation set
-# loss_args:
-#   loss_posi: [[0],[1]]
-#   loss_weight: [[1.0],[1.0]]
 
 model:
   tse_model: TSE_BSRNN_SPK
@@ -117,8 +114,6 @@ model_args:
 model_init:
   tse_model: null
   discriminator: null
-  spk_model: null
-
 num_avg: 10
 num_epochs: 150
 
@@ -126,11 +121,11 @@ optimizer:
   tse_model: Adam
 optimizer_args:
   tse_model:
-    lr: 0.001  # NOTICE: These args do NOT work! The initial lr is determined in the scheduler_args currently!
+    lr: 0.001
     weight_decay: 0.0001
 
 clip_grad: 5.0
-save_epoch_interval: 1
+save_epoch_interval: 10
 
 scheduler:
   tse_model: ExponentialDecrease
