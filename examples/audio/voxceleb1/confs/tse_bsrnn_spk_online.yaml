@@ -1,5 +1,5 @@
 dataloader_args:
-  batch_size: 12
+  batch_size: 2
   drop_last: true
   num_workers: 6
   pin_memory: false
@@ -37,19 +37,21 @@ dataset_args:
   mix_snr:
     range: [-5, 10] # signal-to-interference ratio in dB
     gain: [-12, 0]
-  noise_prob: 0.5
+  noise_prob: 0
   noise_lmdb_file:  './data/musan/lmdb'
-  reverb_prob: 0.5
+  reverb_prob: 0
   reverb_conf:
     min_max_room: [[3, 3, 2.5], [8, 6, 4]]
     rt60: [0.1, 0.6]
     mic_dist: [0.2, 4.0]
-  speaker_feat: &speaker_feat False
-  fbank_args:
-    num_mel_bins: 80
-    frame_shift: 10
-    frame_length: 25
-    dither: 1.0
+  cues:
+    audio:
+      use: true
+      required: true
+  cue_processing:
+    audio:
+      reverb_enroll_prob: 0
+      noise_enroll_prob: 0
 
 enable_amp: false
 exp_dir: exp/BSRNN
@@ -63,8 +65,6 @@ model:
   tse_model: TSE_BSRNN_SPK
 model_args:
   tse_model:
-    joint_training: True
-    multi_task: False
     separator:
       sr: *sr
       win: 512
@@ -79,13 +79,13 @@ model_args:
           enabled: False
           glue: 512
         usef:
-          enabled: False
+          enabled: True
           spec_dim: 2
           approx_qk_dim: 512
           n_head: 4
           t_ksize: 3
         tfmap:
-          enabled: True
+          enabled: False
           type: "spec"   # 'spec'
         context:
           enabled: True
@@ -146,7 +146,7 @@ optimizer_args:
     weight_decay: 0.0001
 
 clip_grad: 5.0
-save_epoch_interval: 10
+save_epoch_interval: 1
 
 scheduler:
   tse_model: ExponentialDecrease

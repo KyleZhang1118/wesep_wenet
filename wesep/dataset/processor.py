@@ -127,71 +127,6 @@ def tar_file_and_group(data):
         sample["stream"].close()
 
 
-# def tar_file_and_group(data):
-#     """Expand a stream of open tar files into a stream of tar file contents.
-#     And groups the file with same prefix
-
-#     Args:
-#         data: Iterable[{src, stream}]
-
-#     Returns:
-#         Iterable[{key, mix_wav, spk1_wav, spk2_wav, ..., sample_rate}]
-#     """
-#     for sample in data:
-#         assert "stream" in sample
-#         stream = tarfile.open(fileobj=sample["stream"], mode="r:*")
-#         # TODO: The mode need to be validated
-#         # In order to be compatible with the torch 2.x version,
-#         # the file reading method here does not use streaming.
-#         prev_prefix = None
-#         example = {}
-#         num_speakers = 0
-#         valid = True
-#         for tarinfo in stream:
-#             name = tarinfo.name
-#             pos = name.rfind(".")
-#             assert pos > 0
-#             prefix, postfix = name[:pos], name[pos + 1:]
-#             if prev_prefix is not None and prev_prefix not in prefix:
-#                 example["key"] = prev_prefix
-#                 if valid:
-#                     example["num_speaker"] = num_speakers
-#                     num_speakers = 0
-#                     yield example
-#                 example = {}
-#                 valid = True
-#             with stream.extractfile(tarinfo) as file_obj:
-#                 try:
-#                     if "spk" in postfix:
-#                         example[postfix] = (
-#                             file_obj.read().decode("utf8").strip())
-#                         num_speakers += 1
-#                     elif postfix in AUDIO_FORMAT_SETS:
-#                         waveform, sample_rate = torchaudio.load(file_obj)
-#                         if prefix[-5:-1] == "_spk":
-#                             example["wav" + prefix[-5:]] = waveform
-#                             prefix = prefix[:-5]
-#                         else:
-#                             example["wav_mix"] = waveform
-#                             example["sample_rate"] = sample_rate
-#                     else:
-#                         example[postfix] = file_obj.read()
-#                 except Exception as ex:
-#                     valid = False
-#                     logging.warning("error to parse {}".format(name))
-#             prev_prefix = prefix
-
-#         if prev_prefix is not None:
-#             example["key"] = prev_prefix
-#             example["num_speaker"] = num_speakers
-#             num_speakers = 0
-#             yield example
-#         stream.close()
-#         if "process" in sample:
-#             sample["process"].communicate()
-#         sample["stream"].close()
-
-
 def tar_file_and_group_single_spk(data):
     """Expand a stream of open tar files into a stream of tar file contents.
     And groups the file with same prefix
@@ -370,33 +305,83 @@ def parse_raw(data):
 
 
 def parse_raw_single_spk(data):
-    """Parse key/wav/spk from json line
-
-    Args:
-        data: Iterable[str], str is a json line has key/wav/spk
-
-    Returns:
-        Iterable[{key, wav, spk, sample_rate}]
     """
+    Parse raw single-speaker samples for online mix.
+
+    Input sample schema (from samples.jsonl):
+    {
+      "key": "...",
+      "spk": ["id10001"],
+      "src": {
+        "id10001": [".../00001.wav"]
+      }
+    }
+
+    Yields:
+    {
+      "key": str,
+      "spk": str,
+      "wav": Tensor [1, T],
+      "sample_rate": int
+    }
+    """
+
     for sample in data:
-        assert "src" in sample
-        json_line = sample["src"]
-        obj = json.loads(json_line)
-        assert "key" in obj
-        assert "wav" in obj
-        assert "spk" in obj
-        key = obj["key"]
-        wav_file = obj["wav"]
-        spk = obj["spk"]
+        # ---- FIX: decode samples.jsonl line if needed ----
+        if "spk" not in sample:
+            if "src" in sample and isinstance(sample["src"], str):
+                sample = json.loads(sample["src"])
+            else:
+                raise ValueError(
+                    f"Unexpected sample format: keys={sample.keys()}")
+        # -------- sanity checks --------
+        spk_list = sample.get("spk", [])
+        if len(spk_list) != 1:
+            raise ValueError(
+                f"parse_raw_single_spk expects single speaker, "
+                f"got {len(spk_list)} in sample {sample.get('key')}")
+
+        spk = spk_list[0]
+
+        src_map = sample.get("src", {})
+        if spk not in src_map:
+            raise KeyError(
+                f"Speaker {spk} missing in src map for sample {sample.get('key')}"
+            )
+
+        wav_list = src_map[spk]
+
+        # -------- explicitly forbid multi-audio (future multi-channel) --------
+        if len(wav_list) != 1:
+            raise NotImplementedError(
+                f"Multiple audio files per speaker are not supported yet "
+                f"(got {len(wav_list)}) in sample {sample.get('key')}")
+
+        wav_path = wav_list[0]
+
+        # -------- load audio --------
         try:
-            waveform, sample_rate = torchaudio.load(wav_file)
-            example = dict(key=key,
-                           spk=spk,
-                           wav=waveform,
-                           sample_rate=sample_rate)
-            yield example
-        except Exception as ex:
-            logging.warning("Failed to read {}".format(wav_file))
+            wav_ch, sr = torchaudio.load(wav_path)  # (C, T) or (T,)
+        except Exception:
+            logging.warning(f"Failed to read wav: {wav_path}")
+            continue
+
+        # -------- normalize shape to [1, T] --------
+        if wav_ch.dim() == 1:
+            wav = wav_ch.unsqueeze(0)
+        else:
+            if wav_ch.size(0) != 1:
+                raise NotImplementedError(
+                    f"Multi-channel wav is not supported yet: "
+                    f"{wav_path}, shape={tuple(wav_ch.shape)}")
+            wav = wav_ch
+
+        yield {
+            "key": sample["key"],
+            "spk": spk,
+            "wav": wav,  # [1, T]
+            "sample_rate": sr,
+        }
 
 
 def sample_speaker_group(data,

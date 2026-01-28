@@ -186,7 +186,7 @@ def build_source_layer(dataset, data_type, online_mix):
         if not online_mix:
             dataset = Processor(dataset, processor.parse_raw)
         else:
-            raise RuntimeError("online_mix is not supported for raw mode")
+            dataset = Processor(dataset, processor.parse_raw_single_spk)
     return dataset
 
 

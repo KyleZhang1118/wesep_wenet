@@ -45,7 +45,7 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     --data ${data} \
     --noise_type ${noise_type} \
     --stage 1 \
-    --stop-stage 3
+    --stop-stage 4
 fi
 
 data=${data}/${noise_type}
@@ -102,8 +102,6 @@ if [ -z "${checkpoint}" ] && [ -f "${exp_dir}/models/avg_best_model.pt" ]; then
   checkpoint="${exp_dir}/models/avg_best_model.pt"
 fi
 
-
-# shellcheck disable=SC2215
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
   echo "Start inferencing ..."
   python wesep/bin/infer.py --config $config \

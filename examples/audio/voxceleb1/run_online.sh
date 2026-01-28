@@ -1,6 +1,7 @@
 #!/bin/bash
 
 # Copyright 2023 Shuai Wang (wangshuai@cuhk.edu.cn)
+#           2026 Ke Zhang (kylezhang1118@gmail.com)
 
 . ./path.sh || exit 1
 
@@ -13,14 +14,14 @@ min_max=min
 noise_type="clean"
 data_type="shard"  # shard/raw
 Vox1_dir=/YourPATH/voxceleb/VoxCeleb1/wav
-Libri2Mix_dir=/YourPATH/librimix/Libri2Mix          #For validate and test the TSE model.
+Libri2Mix_dir=YourPATH/librimix/Libri2Mix          #For validate and test the TSE model.
 mix_data_path="${Libri2Mix_dir}/wav${fs}/${min_max}"
 
 gpus="[0,1]"
 num_avg=10
 checkpoint=
-config=confs/bsrnn_online.yaml
-exp_dir=exp/BSRNN_Online/no_spk_transform_multiply
+config=confs/tse_bsrnn_spk_online.yaml
+exp_dir=exp/TSE_BSRNN_SPK_Online
 save_results=False
 
 
@@ -34,7 +35,7 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     --data ${data} \
     --noise_type ${noise_type} \
     --stage 1 \
-    --stop-stage 6
+    --stop-stage 5
 fi
 
 data=${data}/${noise_type}
@@ -42,20 +43,24 @@ data=${data}/${noise_type}
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
   echo "Covert train and test data to ${data_type}..."
   for dset in train-vox1; do
-    python tools/make_shard_online.py --num_utts_per_shard 1000 \
-        --num_threads 16 \
-        --prefix shards \
-        --shuffle \
-        ${data}/$dset/wav.scp ${data}/$dset/utt2spk \
-        ${data}/$dset/shards_online ${data}/$dset/shard_online.list
-  done
-  for dset in dev test; do
-    python tools/make_shard_list_premix.py --num_utts_per_shard 1000 \
+    python tools/make_shards_from_samples_online.py \
+      --samples ${data}/${dset}/samples.jsonl \
+      --num_utts_per_shard 1000 \
       --num_threads 16 \
       --prefix shards \
       --shuffle \
-      ${data}/$dset/wav.scp ${data}/$dset/utt2spk \
-      ${data}/$dset/shards ${data}/$dset/shard.list
+      ${data}/${dset}/shards \
+      ${data}/${dset}/shard.list
+  done
+  for dset in dev test; do
+    python tools/make_shards_from_samples.py \
+      --samples ${data}/${dset}/samples.jsonl \
+      --num_utts_per_shard 1000 \
+      --num_threads 16 \
+      --prefix shards \
+      --shuffle \
+      ${data}/${dset}/shards \
+      ${data}/${dset}/shard.list
   done
 fi
 
@@ -77,16 +82,14 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     --gpus $gpus \
     --num_avg ${num_avg} \
     --data_type "${data_type}" \
-    --train_data ${data}/train-vox1/${data_type}_online.list \
-    --train_utt2spk ${data}/train-vox1/utt2spk \
-    --train_spk2utt ${data}/train-vox1/spk2enroll.json \
+    --train_data ${data}/train-vox1/${data_type}.list \
+    --train_cues ${data}/train-vox1/cues.yaml \
+    --train_samples ${data}/train-vox1/samples.jsonl \
     --val_data ${data}/dev/${data_type}.list \
-    --val_spk2utt ${data}/dev/single.wav.scp \
-    --val_spk1_enroll ${data}/dev/spk1.enroll \
-    --val_spk2_enroll ${data}/dev/spk2.enroll \
+    --val_cues ${data}/dev/cues.yaml \
+    --val_samples ${data}/dev/samples.jsonl \
     ${checkpoint:+--checkpoint $checkpoint}
 fi
-
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
   echo "Do model average ..."
@@ -103,14 +106,15 @@ if [ -z "${checkpoint}" ] && [ -f "${exp_dir}/models/avg_best_model.pt" ]; then
 fi
 
 if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
+  echo "Start inferencing ..."
   python wesep/bin/infer.py --config $config \
-      --gpus 0 \
-      --exp_dir ${exp_dir} \
-      --data_type "${data_type}" \
-      --test_data ${data}/test/${data_type}.list \
-      --test_spk1_enroll ${data}/test/spk1.enroll \
-      --test_spk2_enroll ${data}/test/spk2.enroll \
-      --test_spk2utt ${data}/test/single.wav.scp \
-      --save_wav ${save_results} \
-      ${checkpoint:+--checkpoint $checkpoint}
+    --fs ${fs} \
+    --gpus 0 \
+    --exp_dir ${exp_dir} \
+    --data_type "${data_type}" \
+    --test_data ${data}/test/${data_type}.list \
+    --test_cues ${data}/test/cues.yaml \
+    --test_samples ${data}/test/samples.jsonl \
+    --save_wav ${save_results} \
+    ${checkpoint:+--checkpoint $checkpoint}
 fi
