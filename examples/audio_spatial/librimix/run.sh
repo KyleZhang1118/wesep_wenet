@@ -14,14 +14,17 @@ fs=16k
 min_max=min
 noise_type="clean"
 data_type="raw" # shard/raw
-Libri2Mix_dir=/YourPATH/librimix/Libri2Mix
+Libri2Mix_dir=/YourPATH/librimix/Libri2Mix  #
 mix_data_path="${Libri2Mix_dir}/wav${fs}/${min_max}"
+
+hybrid_cues=true
+keep_ratio=0.7      
 
 # Training related
 gpus="[0]"
-config=confs/tse_bsrnn_spatial.yaml
+config=confs/tse_bsrnn_spk_spatial.yaml
 data_config=confs/create_dataset.yaml
-exp_dir=exp/TSE_BSRNN_SPATIAL
+exp_dir=exp/TSE_BSRNN_SPK_SPATIAL
 if [ -z "${config}" ] && [ -f "${exp_dir}/config.yaml" ]; then
   config="${exp_dir}/config.yaml"
 fi
@@ -48,14 +51,16 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
 fi
 
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
-  echo "Prepare datasets ..."
-  ./local/prepare_data.sh --mix_data_path ${mix_data_path} \
+  echo "Prepare datasets (hybrid_cues=${hybrid_cues}, keep_ratio=${keep_ratio}) ..."
+  ./local/prepare_data.sh \
+    --mix_data_path ${mix_data_path} \
     --data ${data} \
     --noise_type ${noise_type} \
+    --hybrid_cues ${hybrid_cues} \
+    --keep_ratio ${keep_ratio} \
     --stage 1 \
-    --stop-stage 2
+    --stop_stage 4
 fi
-
 data=${data}/${noise_type}
 
 # if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ] && [ "${datatype}" = "shard" ]; then
@@ -104,7 +109,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     --src_path $exp_dir/models \
     --num ${num_avg} \
     --mode best \
-    --epochs ""
+    --epochs "138,141"
 fi
 if [ -z "${checkpoint}" ] && [ -f "${exp_dir}/models/avg_best_model.pt" ]; then
   checkpoint="${exp_dir}/models/avg_best_model.pt"

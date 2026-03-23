@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 import math
+import copy
 from wesep.modules.common.deep_update import deep_update
-from wesep.modules.feature.speech import STFT
-from wesep.modules.spatial.pos_encoding import CycPosEncoding
+from wesep.modules.spatial.pos_encoding import PosEncodingFactory
 
 class BaseSpatialFeature(nn.Module):
     def __init__(self, config, geometry_ctx=None):
@@ -37,95 +37,140 @@ class BaseSpatialFeature(nn.Module):
         TPD = self.omega_over_c.view(1, 1, F_dim, 1) * dist_delay.unsqueeze(-1).unsqueeze(-1)
         return TPD 
 
-    def compute(self, azi, ele=None, Y=None,pairs=None):
+    def compute(self, azi=None, ele=None, Y=None,pairs=None):
         raise NotImplementedError
 
     def post(self, mix_repr, spatial_repr):
         raise NotImplementedError
+class SpatialEncoderGroup(nn.Module):
+    def __init__(self, base_encoder: nn.Module, num_layers: int):
+        super().__init__()
+        self.num_layers = num_layers
+        self.layers = nn.ModuleList([copy.deepcopy(base_encoder) for _ in range(num_layers)])
 
-class CycEncoder(BaseSpatialFeature):
-    def __init__(self, config):
-        super().__init__(config)
+    def compute(self, azi=None, ele=None, Y=None, pairs=None, layer_idx=None):
+        if layer_idx is not None:
+            return self.layers[layer_idx].compute(azi=azi, ele=ele, Y=Y, pairs=pairs)
+            
+        results = []
+        for layer in self.layers:
+            results.append(layer.compute(azi=azi, ele=ele, Y=Y, pairs=pairs))
+        return results
+
+    def post(self, mix_repr, spatial_repr, layer_idx=None):
+        if layer_idx is not None:
+            return self.layers[layer_idx].post(mix_repr, spatial_repr)
+            
+        if self.num_layers == 1:
+            repr_item = spatial_repr[0] if isinstance(spatial_repr, list) else spatial_repr
+            return self.layers[0].post(mix_repr, repr_item)
+            
+        out_repr = mix_repr
+        for i, layer in enumerate(self.layers):
+            out_repr = layer.post(out_repr, spatial_repr[i])
+            
+        return out_repr
+class InitStatesFeature(BaseSpatialFeature): 
+    def __init__(self, config, geometry_ctx=None):
+        super().__init__(config, geometry_ctx)
         
-        enc_cfg = self.config
-        self.embed_dim = enc_cfg['cyc_dimension']  # e.g., 40
-        self.alpha = enc_cfg.get('cyc_alpha', 1.0) # e.g., 20
-        self.enabled = enc_cfg['enabled']
-        self.use_ele = enc_cfg.get('use_ele', False) 
-        self.fusion = enc_cfg.get('fusion_type',"concat")
-        out_channels = enc_cfg['out_channel']
+        self.hidden_size_f = config["hidden_size_f"]
+        self.hidden_size_t = config["hidden_size_t"]
+        self.use_ele = config.get("use_ele", False)
         
-        self.cyc_pos = CycPosEncoding(embed_dim=self.embed_dim, alpha=self.alpha)
+        encoding_cfg = config.get("encoding_config", {})
+        self.encoder, self.enc_dim = PosEncodingFactory.create(encoding_cfg, self.use_ele)
         
-        mlp_input_dim = self.embed_dim * 2 if self.use_ele else self.embed_dim
+        self.encoding_type = encoding_cfg.get("encoding", "oh")
         
-        # 4. Clue Encoder Structure (Linear -> LN -> PReLU)
+        self.proj_band_h0 = nn.Linear(self.enc_dim, self.hidden_size_f)
+        self.proj_band_c0 = nn.Linear(self.enc_dim, self.hidden_size_f)
+        self.proj_comm_h0 = nn.Linear(self.enc_dim, self.hidden_size_t)
+        self.proj_comm_c0 = nn.Linear(self.enc_dim, self.hidden_size_t)
+
+    def compute(self, azi, ele=None, Y=None, pairs=None):
+        is_missing = (azi <= -998.0)
+        
+        safe_azi = torch.where(is_missing, torch.zeros_like(azi), azi)
+        
+        if is_missing.dim() == 2:
+            is_missing = is_missing[:, 0]
+        is_missing = is_missing.view(-1, 1)
+
+        if safe_azi.dim() == 2: safe_azi = safe_azi[:, 0]
+        
+        if ele is not None:
+            safe_ele = torch.where(ele <= -998.0, torch.zeros_like(ele), ele)
+            if safe_ele.dim() == 2: safe_ele = safe_ele[:, 0]
+        else:
+            safe_ele = None
+        doa_enc = self.encoder(safe_azi)
+        if self.use_ele and safe_ele is not None:
+            ele_input = torch.abs(safe_ele) if self.encoding_type in ["oh", "onehot"] else safe_ele
+            ele_enc = self.encoder(ele_input)
+            doa_enc = torch.cat([doa_enc, ele_enc], dim=-1)
+        band_h0 = self.proj_band_h0(doa_enc)
+        band_c0 = self.proj_band_c0(doa_enc)
+        comm_h0 = self.proj_comm_h0(doa_enc)
+        comm_c0 = self.proj_comm_c0(doa_enc)
+        zeros_f = torch.zeros_like(band_h0)
+        zeros_t = torch.zeros_like(comm_h0)
+        
+        return {
+            "band_h0": torch.where(is_missing, zeros_f, band_h0),
+            "band_c0": torch.where(is_missing, zeros_f, band_c0),
+            "comm_h0": torch.where(is_missing, zeros_t, comm_h0),
+            "comm_c0": torch.where(is_missing, zeros_t, comm_c0)
+        }
+
+    def post(self, mix_repr, spatial_repr):
+        return mix_repr
+        
+class TimeVariantMultiplyFeature(BaseSpatialFeature): 
+    def __init__(self, config, geometry_ctx=None):
+        super().__init__(config, geometry_ctx)
+        
+        self.out_channels = config['out_channel']
+        self.use_ele = config.get('use_ele', False)
+        
+        encoding_cfg = config.get("encoding_config", {})
+        self.encoder, self.enc_dim = PosEncodingFactory.create(encoding_cfg, self.use_ele)
+        self.encoding_type = encoding_cfg.get("encoding", "cyc")
+        
         self.mlp = nn.Sequential(
-            nn.Linear(mlp_input_dim, out_channels),
-            nn.LayerNorm(out_channels),
+            nn.Linear(self.enc_dim, self.out_channels),
+            nn.LayerNorm(self.out_channels),
             nn.PReLU()
         )
+    def compute(self, azi, ele=None, Y=None, pairs=None):
+        if azi.dim() == 1: azi = azi.unsqueeze(1)
+        if ele is not None and ele.dim() == 1: ele = ele.unsqueeze(1)
         
-        self.out_channels = out_channels
+        doa_enc = self.encoder(azi)
+        if self.use_ele and ele is not None:
+            ele_input = torch.abs(ele) if self.encoding_type in ["oh", "onehot"] else ele
+            ele_enc = self.encoder(ele_input)
+            doa_enc = torch.cat([doa_enc, ele_enc], dim=-1)
 
-    def compute(self, azi, ele=None, Y=None,pairs=None):
-        if not self.enabled:
-            return None
+        # Input: (B, T, enc_dim) -> Output: (B, T, out_channels)
+        spatial_repr = self.mlp(doa_enc)
+        spatial_repr = spatial_repr.permute(0, 2, 1).unsqueeze(2) # (B, C, 1, T)
 
-        if azi.dim() == 1:
-            azi = azi.unsqueeze(1) # (B,) -> (B, 1)
-        if ele is not None and ele.dim() == 1:
-            ele = ele.unsqueeze(1)
-        
-        enc_feat = self.cyc_pos(azi)
-        if self.use_ele:
-            if ele is None:
-                raise ValueError("Config indicates 'use_ele=True' but 'ele' input is None!")
-            
-            # Input: (B, T) -> Output: (B, T, D)
-            enc_ele = self.cyc_pos(ele)
-            
-            # (B, T, D) + (B, T, D) -> (B, T, 2*D)
-            enc_feat = torch.cat([enc_feat, enc_ele], dim=-1)
-
-        # Input: (B, T, mlp_input_dim) -> Output: (B, T, out_channels)
-        spatial_repr = self.mlp(enc_feat)
-
-        # (B, T, C) -> Permute to (B, C, T) -> Unsqueeze to (B, C, 1, T)
-        spatial_repr = spatial_repr.permute(0, 2, 1).unsqueeze(2)
-        
-        return spatial_repr
+        is_missing = (azi <= -998.0).view(-1, 1, 1, 1)
+        return torch.where(is_missing, torch.ones_like(spatial_repr), spatial_repr)
 
     def post(self, mix_repr, spatial_repr):
-        """
-        Args:
-            mix_repr: (B, C_mix, F, T)   <-- 主干特征，例如 (Batch, 192, 257, 100)
-            spatial_repr: (B, C_enc, 1, T) <-- DOA特征，例如 (Batch, 192, 1, 100)
-        Returns:
-            Fused feature: (B, C_out, F, T)
-        """
         if spatial_repr is None:
             return mix_repr
-            
-        if self.fusion == "concat":
-            target_F = mix_repr.shape[2]
-            target_T = mix_repr.shape[3]
-            spatial_repr_expanded = spatial_repr.expand(-1, -1, target_F, target_T)
-            out = torch.cat([mix_repr, spatial_repr_expanded], dim=1)
-            
-        elif self.fusion == "multiply":
-            if mix_repr.shape[1] != spatial_repr.shape[1]:
-                raise ValueError(
-                    f"Fusion 'multiply' requires same channel dimensions. "
-                    f"Mix: {mix_repr.shape[1]}, Spatial: {spatial_repr.shape[1]}. "
-                    f"Please check config['out_channel']."
-                )
-            out = mix_repr * spatial_repr
-
-        return out
-
+        if mix_repr.shape[1] != spatial_repr.shape[1]:
+            raise ValueError(
+                f"Fusion 'multiply' requires same channel dimensions. "
+                f"Mix: {mix_repr.shape[1]}, Spatial: {spatial_repr.shape[1]}."
+            )
+        return mix_repr * spatial_repr
+    
 class IPDFeature(BaseSpatialFeature):
-    def compute(self, Y, azi, ele, pairs=None):
+    def compute(self, Y, azi=None, ele=None, pairs=None):
         target_pairs = self._get_pairs(pairs)
         ipd_list = []
         for (i, j) in target_pairs:
@@ -138,7 +183,7 @@ class IPDFeature(BaseSpatialFeature):
         return torch.cat([mix_repr, spatial_repr], dim=1)
 
 class CDFFeature(BaseSpatialFeature):
-    def compute(self, Y, azi, ele, pairs=None):
+    def compute(self, Y, azi, ele=None, pairs=None):
         target_pairs = self._get_pairs(pairs)
         ipd_list = []
         for (i, j) in target_pairs:
@@ -150,14 +195,17 @@ class CDFFeature(BaseSpatialFeature):
         _, _, F_dim, _ = Y.shape
         TPD = self._compute_tpd(azi, ele, F_dim, target_pairs)
         
-        return torch.cos(IPD - TPD)
+        out = torch.cos(IPD - TPD)
+        
+        is_missing = (azi <= -998.0).view(-1, 1, 1, 1) 
+        return torch.where(is_missing, torch.ones_like(out), out)
 
     def post(self, mix_repr, spatial_repr):
         return torch.cat([mix_repr, spatial_repr], dim=1)
 
 
 class SDFFeature(BaseSpatialFeature):
-    def compute(self, Y, azi, ele, pairs=None):
+    def compute(self, Y, azi, ele=None, pairs=None):
         target_pairs = self._get_pairs(pairs)
         ipd_list = []
         for (i, j) in target_pairs:
@@ -169,13 +217,16 @@ class SDFFeature(BaseSpatialFeature):
         _, _, F_dim, _ = Y.shape
         TPD = self._compute_tpd(azi, ele, F_dim, target_pairs)
         
-        return torch.sin(IPD - TPD)
+        out = torch.sin(IPD - TPD)
+        
+        is_missing = (azi <= -998.0).view(-1, 1, 1, 1)
+        return torch.where(is_missing, torch.zeros_like(out), out)
 
     def post(self, mix_repr, spatial_repr):
         return torch.cat([mix_repr, spatial_repr], dim=1)
 
 class DSTFTFeature(BaseSpatialFeature):
-    def compute(self, Y, azi, ele, pairs=None):
+    def compute(self, Y, azi=None, ele=None, pairs=None):
         target_pairs = self._get_pairs(pairs)
         d_list = []
         
@@ -213,16 +264,43 @@ class SpatialFrontend(nn.Module):
             },
             "pairs": [[0, 1], [1, 2], [2, 3], [0, 3]], 
             "features": {
-                "ipd": {"enabled": False},
-                "cdf": {"enabled": False},
-                "sdf": {"enabled": False},
-                "delta_stft": {"enabled": False},
-                "cyc_doaemb":{
+                "ipd": {
+                    "enabled": False, 
+                    "num_encoder": 1
+                },
+                "cdf": {
+                    "enabled": False, 
+                    "num_encoder": 1
+                },
+                "sdf": {
+                    "enabled": False, 
+                    "num_encoder": 1
+                },
+                "delta_stft": {
+                    "enabled": False, 
+                    "num_encoder": 1
+                },
+                "Multiply_emb": {
                     "enabled": False,
-                    "cyc_alpha": 20,
-                    "cyc_dimension": 40,
+                    "num_encoder": 1,
+                    "encoding_config":{
+                        "encoding": "cyc",
+                        "cyc_alpha": 20,
+                        "cyc_dimension": 40,
+                    },
                     "use_ele": True,
                     "out_channel": 1
+                },
+                "InitStates_emb": {  
+                    "enabled": False,
+                    "num_encoder": 1,
+                    "encoding_config":{
+                        "encoding": "oh",
+                        "emb_dim": 180,
+                    },
+                    "hidden_size_f": 256,
+                    "hidden_size_t": 256,
+                    "use_ele" : True
                 }
             }
         }
@@ -249,21 +327,30 @@ class SpatialFrontend(nn.Module):
         self.default_pairs = self.config['pairs']
         feat_cfg = self.config['features']
         
-        if feat_cfg['ipd']['enabled']:
-            self.features['ipd'] = IPDFeature({'pairs': self.default_pairs}, geometry_ctx)
+        FEATURE_REGISTRY = {
+            'ipd': IPDFeature,
+            'cdf': CDFFeature,
+            'sdf': SDFFeature,
+            'delta_stft': DSTFTFeature,
+            'Multiply_emb': TimeVariantMultiplyFeature,
+            'InitStates_emb': InitStatesFeature
+        }
         
-        if feat_cfg['cdf']['enabled']:
-            self.features['cdf'] = CDFFeature({'pairs': self.default_pairs}, geometry_ctx)
-
-        if feat_cfg['sdf']['enabled']:
-            self.features['sdf'] = SDFFeature({'pairs': self.default_pairs}, geometry_ctx)
-
-        if feat_cfg['delta_stft']['enabled']:
-            self.features['delta_stft'] = DSTFTFeature({'pairs': self.default_pairs}, geometry_ctx)
+        for feat_name, sub_cfg in feat_cfg.items():
+            if not sub_cfg.get('enabled', False):
+                continue
+                
+            if feat_name not in FEATURE_REGISTRY:
+                raise ValueError(f"Unknown spatial feature in config: {feat_name}")
+                
+            num_encoder = sub_cfg.get('num_encoder', 1)
             
-        if feat_cfg['cyc_doaemb']['enabled']:
-            self.features['cyc_doaemb']= CycEncoder(feat_cfg['cyc_doaemb'])
-
+            sub_cfg_with_pairs = deep_update({'pairs': self.default_pairs}, sub_cfg)
+            
+            base_module = FEATURE_REGISTRY[feat_name](sub_cfg_with_pairs, geometry_ctx)
+            
+            self.features[feat_name] = SpatialEncoderGroup(base_module, num_encoder)
+        
     def compute_all(self, Y, azi, ele=None, pairs=None):
         if ele is None:
             ele = torch.zeros_like(azi)
@@ -273,20 +360,3 @@ class SpatialFrontend(nn.Module):
             out[name] = module.compute(Y=Y, azi=azi, ele=ele, pairs=pairs)
             
         return out
-    def post_all(self, mix_repr, feature_dict):
-        current_feat = mix_repr
-    
-        feat_cfg = self.config['features']
-        
-        for name in feat_cfg:
-            sub_cfg = feat_cfg[name]
-            
-            if not sub_cfg.get('enabled', False):
-                continue
-            
-            if name in self.features and name in feature_dict:
-                module = self.features[name]
-                raw_data = feature_dict[name]
-                current_feat = module.post(current_feat, raw_data)
-        
-        return current_feat
